@@ -1,3 +1,4 @@
+import glob
 import os
 import re
 import sys
@@ -22,7 +23,7 @@ def parse_codeowners(codeowners_path):
             if file_path.startswith("/"):
                 file_path = file_path[1:]
 
-            if not os.path.exists(file_path):
+            if not os.path.exists(file_path) and not glob.glob(file_path):
                 nonexistent_files.append((file_path, owner))
 
     return nonexistent_files
@@ -37,8 +38,7 @@ def main():
     if nonexistent_files:
         print("The following files listed in CODEOWNERS do not exist:")
         for file, owner in nonexistent_files:
-            if "*" not in file:
-                print(f"- {file}")
+            print(f"- {file}")
     else:
         print("All files listed in CODEOWNERS exist.")
 
