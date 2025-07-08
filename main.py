@@ -4,6 +4,7 @@ import re
 import sys
 import argparse
 import subprocess # Added for git command
+import fnmatch  # Added for pattern matching
 from rich.console import Console
 from rich.table import Table
 
@@ -135,6 +136,169 @@ def generate_diff_patch(codeowners_filepath, nonexistent_entries, original_codeo
     return "\n".join(patch_lines) + "\n" # Ensure final newline for patch format
 
 
+def get_all_tracked_files(project_root):
+    """Get all files tracked by git in the repository."""
+    try:
+        # Get all tracked files relative to the repo root
+        output = subprocess.check_output(
+            ['git', '-C', project_root, 'ls-files'],
+            stderr=subprocess.STDOUT,
+            text=True
+        ).strip()
+        
+        if not output:
+            return []
+            
+        files = output.split('\n')
+        return [f.strip() for f in files if f.strip()]
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        Console().print("[bold red]Error: Could not get tracked files from git. Make sure you're in a git repository.[/bold red]")
+        return []
+
+
+def normalize_codeowners_pattern(pattern):
+    """Normalize a CODEOWNERS pattern for matching."""
+    # Remove leading slash if present (it means "from root")
+    if pattern.startswith('/'):
+        pattern = pattern[1:]
+    
+    return pattern
+
+
+def file_matches_pattern(file_path, pattern):
+    """Check if a file path matches a CODEOWNERS pattern."""
+    # Normalize the pattern
+    normalized_pattern = normalize_codeowners_pattern(pattern)
+    
+    # Handle directory patterns (ending with /)
+    if normalized_pattern.endswith('/'):
+        # This pattern matches directories and everything in them
+        dir_pattern = normalized_pattern.rstrip('/')
+        # Check if file is in this directory
+        if file_path.startswith(dir_pattern + '/') or file_path == dir_pattern:
+            return True
+        # Also check with glob pattern matching for wildcards
+        return fnmatch.fnmatch(os.path.dirname(file_path) + '/', normalized_pattern)
+    
+    # Regular file pattern matching
+    if fnmatch.fnmatch(file_path, normalized_pattern):
+        return True
+    
+    # Check if any parent directory matches the pattern
+    path_parts = file_path.split('/')
+    for i in range(len(path_parts)):
+        partial_path = '/'.join(path_parts[:i+1])
+        if fnmatch.fnmatch(partial_path, normalized_pattern):
+            return True
+    
+    return False
+
+
+def get_codeowners_patterns(codeowners_path):
+    """Extract all patterns from the CODEOWNERS file."""
+    patterns = []
+    
+    if not os.path.exists(codeowners_path):
+        Console().print(f"[bold red]Error: {codeowners_path} does not exist.[/bold red]")
+        return patterns
+    
+    with open(codeowners_path, "r", encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            
+            parts = re.split(r"\s+", line, maxsplit=1)
+            if parts:
+                patterns.append(parts[0])
+    
+    return patterns
+
+
+def group_uncovered_by_directories(uncovered_files, all_tracked_files):
+    """Group uncovered files by directories when all files in a directory are uncovered."""
+    if not uncovered_files:
+        return []
+    
+    uncovered_set = set(uncovered_files)
+    
+    # Find all directories and the files they contain
+    dir_to_files = {}
+    for file_path in all_tracked_files:
+        dir_path = os.path.dirname(file_path)
+        if dir_path:  # Only consider files in subdirectories
+            if dir_path not in dir_to_files:
+                dir_to_files[dir_path] = []
+            dir_to_files[dir_path].append(file_path)
+    
+    # Find directories where ALL tracked files are uncovered
+    fully_uncovered_dirs = []
+    for dir_path, files_in_dir in dir_to_files.items():
+        if all(file_path in uncovered_set for file_path in files_in_dir):
+            fully_uncovered_dirs.append(dir_path)
+    
+    # Sort by depth (deepest first) to prefer most specific directories
+    fully_uncovered_dirs.sort(key=lambda d: d.count('/'), reverse=True)
+    
+    # Remove parent directories if their children are already included
+    final_dirs = []
+    for dir_path in fully_uncovered_dirs:
+        # Check if any already selected directory is a child of this one
+        is_parent_of_selected = any(
+            selected_dir.startswith(dir_path + '/') 
+            for selected_dir in final_dirs
+        )
+        if not is_parent_of_selected:
+            final_dirs.append(dir_path)
+    
+    # Build result list
+    result = []
+    covered_files = set()
+    
+    # Add directories
+    for dir_path in sorted(final_dirs):
+        result.append(f"{dir_path}/")
+        # Mark all files in this directory as covered
+        for file_path in dir_to_files[dir_path]:
+            covered_files.add(file_path)
+    
+    # Add individual uncovered files not in any covered directory
+    individual_files = [
+        file_path for file_path in uncovered_files 
+        if file_path not in covered_files
+    ]
+    result.extend(sorted(individual_files))
+    
+    return result
+
+
+def find_uncovered_files(project_root, codeowners_path):
+    """Find all tracked files that are not covered by any CODEOWNERS pattern."""
+    tracked_files = get_all_tracked_files(project_root)
+    if not tracked_files:
+        return []
+    
+    codeowners_patterns = get_codeowners_patterns(codeowners_path)
+    if not codeowners_patterns:
+        Console().print("[bold yellow]No patterns found in CODEOWNERS file.[/bold yellow]")
+        return tracked_files
+    
+    uncovered_files = []
+    
+    for file_path in tracked_files:
+        is_covered = False
+        for pattern in codeowners_patterns:
+            if file_matches_pattern(file_path, pattern):
+                is_covered = True
+                break
+        
+        if not is_covered:
+            uncovered_files.append(file_path)
+    
+    # Group by directories when appropriate
+    return group_uncovered_by_directories(uncovered_files, tracked_files)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Check for non-existent paths in a CODEOWNERS file.")
     parser.add_argument(
@@ -151,14 +315,39 @@ def main():
         action="store_true",
         help="Generate a git patch to remove non-existent paths and save it to stale-codeowners.patch."
     )
+    parser.add_argument(
+        "--find-uncovered",
+        action="store_true",
+        help="Find files in the repository that are not covered by any CODEOWNERS pattern."
+    )
     args = parser.parse_args()
 
     args.project_root = os.path.abspath(args.project_root)
     args.codeowners_path = os.path.abspath(args.codeowners_path)
 
-    nonexistent_entries, original_codeowners_lines = parse_codeowners(args.codeowners_path, args.project_root)
-    
     console = Console()
+
+    # Handle find uncovered files mode
+    if args.find_uncovered:
+        uncovered_files = find_uncovered_files(args.project_root, args.codeowners_path)
+        
+        if uncovered_files:
+            console.print(
+                f"[bold yellow]{len(uncovered_files)} files in the repository are not covered by CODEOWNERS.[/bold yellow]"
+            )
+            table = Table(title="Files not covered by CODEOWNERS")
+            table.add_column("File Path", style="cyan")
+            
+            for file_path in sorted(uncovered_files):
+                table.add_row(file_path)
+            
+            console.print(table)
+            sys.exit(1)  # Exit with error code to indicate uncovered files found
+        else:
+            console.print("[bold green]All tracked files are covered by CODEOWNERS patterns.[/bold green]")
+            sys.exit(0)
+
+    nonexistent_entries, original_codeowners_lines = parse_codeowners(args.codeowners_path, args.project_root)
 
     if args.generate_patch:
         if nonexistent_entries:
