@@ -35,6 +35,185 @@ def get_git_repo_root(path_within_repo):
         return None
 
 
+def get_moved_files(project_root, since_commit=None):
+    """Get all files that have been moved/renamed in git history."""
+    try:
+        # Base command to get renamed/moved files
+        cmd = ['git', '-C', project_root, 'log', '--diff-filter=R', '--name-status', '--pretty=format:']
+        
+        # Add since commit if specified
+        if since_commit:
+            cmd.append(f'{since_commit}..HEAD')
+        
+        output = subprocess.check_output(
+            cmd,
+            stderr=subprocess.STDOUT,
+            text=True
+        ).strip()
+        
+        if not output:
+            return []
+        
+        moved_files = []
+        for line in output.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Git log with --name-status shows: R<percentage>    old_path    new_path
+            # or just: R    old_path    new_path
+            parts = line.split('\t')
+            if len(parts) >= 3 and parts[0].startswith('R'):
+                old_path = parts[1]
+                new_path = parts[2]
+                moved_files.append((old_path, new_path))
+        
+        return moved_files
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        Console().print("[bold red]Error: Could not get moved files from git. Make sure you're in a git repository.[/bold red]")
+        return []
+
+
+def update_codeowners_for_moved_files(codeowners_path, moved_files, project_root):
+    """Update CODEOWNERS patterns to reflect moved files."""
+    if not moved_files:
+        Console().print("[bold green]No moved files detected.[/bold green]")
+        return False
+    
+    if not os.path.exists(codeowners_path):
+        Console().print(f"[bold red]Error: {codeowners_path} does not exist.[/bold red]")
+        return False
+    
+    # Read current CODEOWNERS content
+    with open(codeowners_path, "r", encoding="utf-8") as file:
+        lines = file.readlines()
+    
+    updated_lines = []
+    changes_made = False
+    console = Console()
+    
+    console.print(f"[bold blue]Checking {len(moved_files)} moved files against CODEOWNERS patterns...[/bold blue]")
+    
+    for line_num, original_line in enumerate(lines, 1):
+        line = original_line.strip()
+        updated_line = original_line
+        
+        # Skip comments and empty lines
+        if not line or line.startswith("#"):
+            updated_lines.append(updated_line)
+            continue
+        
+        # Parse the line to get pattern and owners
+        parts = re.split(r"\s+", line, maxsplit=1)
+        if not parts:
+            updated_lines.append(updated_line)
+            continue
+        
+        pattern = parts[0]
+        owners = parts[1] if len(parts) > 1 else ""
+        
+        # Check if this pattern needs updating based on moved files
+        updated_pattern = update_pattern_for_moved_files(pattern, moved_files)
+        
+        if updated_pattern != pattern:
+            # Reconstruct the line with the updated pattern
+            if owners:
+                updated_line = f"{updated_pattern} {owners}\n"
+            else:
+                updated_line = f"{updated_pattern}\n"
+            
+            console.print(f"[bold yellow]Line {line_num}: Updated pattern[/bold yellow]")
+            console.print(f"  [red]- {pattern}[/red]")
+            console.print(f"  [green]+ {updated_pattern}[/green]")
+            changes_made = True
+        
+        updated_lines.append(updated_line)
+    
+    # Write back the updated content if changes were made
+    if changes_made:
+        with open(codeowners_path, "w", encoding="utf-8") as file:
+            file.writelines(updated_lines)
+        console.print(f"[bold green]CODEOWNERS file updated successfully.[/bold green]")
+        return True
+    else:
+        console.print("[bold green]No CODEOWNERS patterns needed updating.[/bold green]")
+        return False
+
+
+def update_pattern_for_moved_files(pattern, moved_files):
+    """Update a single CODEOWNERS pattern based on moved files."""
+    # Handle leading slash
+    has_leading_slash = pattern.startswith('/')
+    clean_pattern = pattern[1:] if has_leading_slash else pattern
+    
+    # Handle directory patterns (ending with /)
+    is_dir_pattern = clean_pattern.endswith('/')
+    if is_dir_pattern:
+        clean_pattern = clean_pattern[:-1]
+    
+    # Check if pattern contains wildcards
+    has_wildcards = any(char in clean_pattern for char in ['*', '?', '['])
+    
+    if has_wildcards:
+        # For wildcard patterns, we need to be more careful
+        # We'll check if the pattern structure matches moved directories
+        updated_pattern = update_wildcard_pattern(clean_pattern, moved_files)
+    else:
+        # For exact patterns, check direct matches
+        updated_pattern = clean_pattern
+        for old_path, new_path in moved_files:
+            if clean_pattern == old_path:
+                updated_pattern = new_path
+                break
+            elif clean_pattern.startswith(old_path + '/'):
+                # Pattern is a subpath of moved directory
+                updated_pattern = clean_pattern.replace(old_path + '/', new_path + '/', 1)
+                break
+    
+    # Reconstruct the pattern with original formatting
+    result = updated_pattern
+    if is_dir_pattern:
+        result += '/'
+    if has_leading_slash:
+        result = '/' + result
+    
+    return result
+
+
+def update_wildcard_pattern(pattern, moved_files):
+    """Update a wildcard pattern based on moved files."""
+    # For wildcard patterns, we need to check if the base directory structure changed
+    # This is more complex and heuristic-based
+    
+    # Find the non-wildcard prefix of the pattern
+    wildcard_pos = min(
+        (pattern.find(char) for char in ['*', '?', '['] if char in pattern),
+        default=len(pattern)
+    )
+    
+    if wildcard_pos == 0:
+        # Pattern starts with wildcard, harder to update automatically
+        return pattern
+    
+    # Get the directory part before wildcards
+    pattern_prefix = pattern[:wildcard_pos]
+    if '/' in pattern_prefix:
+        pattern_dir = '/'.join(pattern_prefix.split('/')[:-1])
+    else:
+        pattern_dir = ''
+    
+    # Check if this directory was moved
+    for old_path, new_path in moved_files:
+        if pattern_dir == old_path:
+            # Direct directory match
+            return pattern.replace(old_path, new_path, 1)
+        elif pattern_dir.startswith(old_path + '/'):
+            # Pattern directory is a subdirectory of moved directory
+            return pattern.replace(old_path + '/', new_path + '/', 1)
+    
+    return pattern
+
+
 def parse_codeowners(codeowners_path, project_root):
     nonexistent_entries_details = []
     original_lines_with_eol = [] # To store all original lines
@@ -320,12 +499,35 @@ def main():
         action="store_true",
         help="Find files in the repository that are not covered by any CODEOWNERS pattern."
     )
+    parser.add_argument(
+        "--update-moved",
+        action="store_true",
+        help="Update CODEOWNERS patterns to reflect files that have been moved/renamed in git."
+    )
+    parser.add_argument(
+        "--since-commit",
+        help="When using --update-moved, only consider moves since this commit (default: all history)."
+    )
     args = parser.parse_args()
 
     args.project_root = os.path.abspath(args.project_root)
     args.codeowners_path = os.path.abspath(args.codeowners_path)
 
     console = Console()
+
+    # Handle update moved files mode
+    if args.update_moved:
+        moved_files = get_moved_files(args.project_root, args.since_commit)
+        if moved_files:
+            console.print(f"[bold blue]Found {len(moved_files)} moved files:[/bold blue]")
+            for old_path, new_path in moved_files:
+                console.print(f"  [yellow]{old_path}[/yellow] → [green]{new_path}[/green]")
+            
+            updated = update_codeowners_for_moved_files(args.codeowners_path, moved_files, args.project_root)
+            sys.exit(0 if updated else 1)
+        else:
+            console.print("[bold green]No moved files found in git history.[/bold green]")
+            sys.exit(0)
 
     # Handle find uncovered files mode
     if args.find_uncovered:
