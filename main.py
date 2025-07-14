@@ -5,6 +5,7 @@ import sys
 import argparse
 import subprocess # Added for git command
 import fnmatch  # Added for pattern matching
+from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
@@ -35,6 +36,118 @@ def get_git_repo_root(path_within_repo):
         return None
 
 
+def matches_codeowners_pattern(file_path, pattern, project_root):
+    """
+    Check if a file path matches a CODEOWNERS pattern.
+    
+    This function handles various CODEOWNERS pattern types:
+    - Simple glob patterns (* and ?)
+    - Directory patterns (ending with /)
+    - Recursive patterns (**)
+    - Absolute paths (starting with /)
+    - Relative paths
+    """
+    # Convert pattern to work with current directory structure
+    if pattern.startswith("/"):
+        # Absolute path from repository root
+        pattern = pattern[1:]  # Remove leading slash
+        full_pattern = os.path.join(project_root, pattern)
+    else:
+        # Relative path - could match anywhere in the repository
+        if "**" in pattern:
+            # Handle recursive patterns
+            full_pattern = os.path.join(project_root, pattern)
+        else:
+            # For non-recursive patterns, try both relative to root and anywhere in repo
+            full_pattern = os.path.join(project_root, pattern)
+    
+    # Handle directory patterns (ending with /)
+    if pattern.endswith("/"):
+        # Directory pattern - match any file within this directory
+        pattern_without_slash = pattern.rstrip("/")
+        if pattern.startswith("/"):
+            dir_pattern = os.path.join(project_root, pattern_without_slash)
+        else:
+            dir_pattern = os.path.join(project_root, pattern_without_slash)
+        
+        # Check if the pattern matches any existing directories
+        if "**" in pattern_without_slash or "*" in pattern_without_slash or "?" in pattern_without_slash:
+            # Use glob for wildcard directory patterns
+            matching_dirs = glob.glob(dir_pattern, recursive=True)
+            return len(matching_dirs) > 0
+        else:
+            # Simple directory check
+            return os.path.isdir(dir_pattern)
+    
+    # Handle file patterns
+    if "**" in pattern:
+        # Recursive pattern - use glob with recursive=True
+        return len(glob.glob(full_pattern, recursive=True)) > 0
+    elif "*" in pattern or "?" in pattern:
+        # Simple glob pattern
+        return len(glob.glob(full_pattern)) > 0
+    else:
+        # Literal file/directory path
+        return os.path.exists(full_pattern)
+
+
+def check_pattern_existence(file_pattern, project_root):
+    """
+    Enhanced function to check if a CODEOWNERS pattern has any matches.
+    
+    This function properly handles:
+    - Wildcard patterns (* and ?)
+    - Recursive patterns (**)
+    - Directory patterns (ending with /)
+    - Absolute and relative paths
+    """
+    # Handle absolute paths (starting with /)
+    if file_pattern.startswith("/"):
+        # Remove leading slash and work from project root
+        pattern_without_slash = file_pattern[1:]
+        effective_path = os.path.join(project_root, pattern_without_slash)
+    else:
+        # Relative path
+        effective_path = os.path.join(project_root, file_pattern)
+    
+    # Normalize the path
+    effective_path = os.path.normpath(effective_path)
+    
+    # Check if this is a directory pattern
+    if file_pattern.endswith("/"):
+        # Directory pattern - check if any directories match
+        dir_pattern = effective_path.rstrip("/")
+        if "*" in dir_pattern or "?" in dir_pattern:
+            # Wildcard directory pattern
+            matching_dirs = []
+            if "**" in dir_pattern:
+                # Recursive directory pattern
+                matching_dirs = glob.glob(dir_pattern, recursive=True)
+            else:
+                # Simple directory pattern
+                matching_dirs = glob.glob(dir_pattern)
+            
+            # Filter to only include directories
+            matching_dirs = [d for d in matching_dirs if os.path.isdir(d)]
+            return len(matching_dirs) > 0
+        else:
+            # Simple directory check
+            return os.path.isdir(dir_pattern)
+    
+    # File pattern handling
+    if "**" in file_pattern:
+        # Recursive pattern
+        matches = glob.glob(effective_path, recursive=True)
+        return len(matches) > 0
+    elif "*" in file_pattern or "?" in file_pattern:
+        # Simple glob pattern
+        matches = glob.glob(effective_path)
+        return len(matches) > 0
+    else:
+        # Literal file/directory path
+        return os.path.exists(effective_path)
+
+
 def parse_codeowners(codeowners_path, project_root):
     nonexistent_entries_details = []
     original_lines_with_eol = [] # To store all original lines
@@ -58,23 +171,9 @@ def parse_codeowners(codeowners_path, project_root):
             if len(parts) > 1:
                 owner_info = parts[1]
 
-            effective_path_to_check = file_pattern
+            # Use the enhanced pattern existence check
             current_project_root = project_root or os.getcwd()
-
-            if file_pattern.startswith("/"):
-                path_in_codeowners = file_pattern[1:]
-                effective_path_to_check = os.path.join(current_project_root, path_in_codeowners)
-            else:
-                effective_path_to_check = os.path.join(current_project_root, file_pattern)
-            
-            effective_path_to_check_normalized = os.path.normpath(effective_path_to_check)
-
-            exists = False
-            if "*" in file_pattern or "?" in file_pattern or "[" in file_pattern:
-                if glob.glob(effective_path_to_check_normalized):
-                    exists = True
-            elif os.path.exists(effective_path_to_check_normalized):
-                exists = True
+            exists = check_pattern_existence(file_pattern, current_project_root)
 
             if not exists:
                 display_owner = owner_info if owner_info else "<No owner specified>"
@@ -299,6 +398,72 @@ def find_uncovered_files(project_root, codeowners_path):
     return group_uncovered_by_directories(uncovered_files, tracked_files)
 
 
+def get_pattern_matches(file_pattern, project_root, max_matches=20):
+    """
+    Get a list of files that match a CODEOWNERS pattern.
+    
+    This is useful for debugging and understanding what files
+    a pattern is matching.
+    """
+    # Handle absolute paths (starting with /)
+    if file_pattern.startswith("/"):
+        # Remove leading slash and work from project root
+        pattern_without_slash = file_pattern[1:]
+        effective_path = os.path.join(project_root, pattern_without_slash)
+    else:
+        # Relative path
+        effective_path = os.path.join(project_root, file_pattern)
+    
+    # Normalize the path
+    effective_path = os.path.normpath(effective_path)
+    
+    matches = []
+    
+    # Check if this is a directory pattern
+    if file_pattern.endswith("/"):
+        # Directory pattern - find matching directories
+        dir_pattern = effective_path.rstrip("/")
+        if "*" in dir_pattern or "?" in dir_pattern:
+            # Wildcard directory pattern
+            if "**" in dir_pattern:
+                # Recursive directory pattern
+                all_matches = glob.glob(dir_pattern, recursive=True)
+            else:
+                # Simple directory pattern
+                all_matches = glob.glob(dir_pattern)
+            
+            # Filter to only include directories
+            matches = [d for d in all_matches if os.path.isdir(d)]
+        else:
+            # Simple directory check
+            if os.path.isdir(dir_pattern):
+                matches = [dir_pattern]
+    else:
+        # File pattern handling
+        if "**" in file_pattern:
+            # Recursive pattern
+            matches = glob.glob(effective_path, recursive=True)
+        elif "*" in file_pattern or "?" in file_pattern:
+            # Simple glob pattern
+            matches = glob.glob(effective_path)
+        else:
+            # Literal file/directory path
+            if os.path.exists(effective_path):
+                matches = [effective_path]
+    
+    # Convert absolute paths back to relative paths from project root
+    relative_matches = []
+    for match in matches[:max_matches]:  # Limit to prevent overwhelming output
+        try:
+            relative_path = os.path.relpath(match, project_root)
+            relative_matches.append(relative_path)
+        except ValueError:
+            # Handle cases where paths are on different drives (Windows)
+            relative_matches.append(match)
+    
+    return relative_matches
+
+
 def main():
     parser = argparse.ArgumentParser(description="Check for non-existent paths in a CODEOWNERS file.")
     parser.add_argument(
@@ -320,12 +485,38 @@ def main():
         action="store_true",
         help="Find files in the repository that are not covered by any CODEOWNERS pattern."
     )
+    parser.add_argument(
+        "--debug-pattern",
+        help="Debug a specific pattern by showing what files it matches (use with --show-matches)."
+    )
+    parser.add_argument(
+        "--show-matches",
+        action="store_true",
+        help="Show what files match each pattern (useful for debugging wildcard patterns)."
+    )
     args = parser.parse_args()
 
     args.project_root = os.path.abspath(args.project_root)
     args.codeowners_path = os.path.abspath(args.codeowners_path)
 
     console = Console()
+
+    # Handle debug pattern mode
+    if args.debug_pattern:
+        console.print(f"[bold cyan]Debugging pattern: {args.debug_pattern}[/bold cyan]")
+        matches = get_pattern_matches(args.debug_pattern, args.project_root)
+        
+        if matches:
+            console.print(f"[bold green]Pattern matches {len(matches)} files:[/bold green]")
+            for match in matches:
+                console.print(f"  {match}")
+        else:
+            console.print("[bold red]Pattern matches no files[/bold red]")
+        
+        # Check if pattern exists
+        exists = check_pattern_existence(args.debug_pattern, args.project_root)
+        console.print(f"[bold yellow]Pattern exists: {exists}[/bold yellow]")
+        return
 
     # Handle find uncovered files mode
     if args.find_uncovered:
@@ -370,9 +561,23 @@ def main():
         table.add_column("File/Pattern", style="cyan", no_wrap=True)
         table.add_column("Owner", style="magenta")
         table.add_column("Original Line Content", style="green")
+        if args.show_matches:
+            table.add_column("Sample Matches", style="yellow")
 
         for file_pattern, owner, line_num, original_line in nonexistent_entries:
-            table.add_row(str(line_num), file_pattern, owner, original_line)
+            row_data = [str(line_num), file_pattern, owner, original_line]
+            
+            if args.show_matches:
+                matches = get_pattern_matches(file_pattern, args.project_root, max_matches=3)
+                if matches:
+                    matches_str = ", ".join(matches)
+                    if len(matches) > 3:
+                        matches_str += f" (+{len(get_pattern_matches(file_pattern, args.project_root)) - 3} more)"
+                else:
+                    matches_str = "No matches"
+                row_data.append(matches_str)
+            
+            table.add_row(*row_data)
         
         console.print(table)
     else:
